@@ -1,13 +1,16 @@
 import express from "express";
 import crypto from "crypto";
-import rateLimit from "express-rate-limit";
+import { razorpayPaymentLimiter } from "../middleware/rateLimiter.js";
 import { Transaction } from "sequelize";
 
 import User from "../models/User.js";
 import Payment from "../models/Payment.js";
+import Course from "../models/Course.js";
 import { sequelize } from "../config/db.js";
 import { createNotification } from "../controllers/notificationController.js";
 import { protect } from "../middleware/authMiddleware.js";
+import validate from "../middleware/validate.js";
+import { createPaymentSchema, verifyRazorpayPaymentSchema } from "../schemas/paymentSchema.js";
 import { paymentGatewayServices } from "../services/paymentGatewayServices.js";
 import buildLogger from "../utils/logger.js";
 
@@ -26,314 +29,380 @@ const prodRedactPaths = [
 
 const log = buildLogger("RAZORPAY", prodRedactPaths);
 
-// Rate limiter for payment creation.
-const paymentLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  message: {
-    error: "Too many payment attempts from this IP. Please try again after 15 minutes.",
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: () => process.env.NODE_ENV === "test",
-});
-
 // CREATE ORDER
 
-router.post("/create-order", protect, paymentLimiter, async (req, res) => {
-  try {
-    const { course, idempotencyKey } = req.body;
-
-    if (
-      !course ||
-      !course.id ||
-      course.priceValue == null ||
-      course.priceValue === "" ||
-      !Number.isFinite(Number(course.priceValue)) ||
-      Number(course.priceValue) <= 0
-    ) {
-      return res.status(400).json({
-        error: "Invalid course data",
-      });
-    }
-
-    if (!idempotencyKey) {
-      return res.status(400).json({
-        error: "idempotencyKey is required",
-      });
-    }
-
-    const userId = req.user.id;
-
-    log.info({ idempotencyKey }, "Idempotency key received");
-
-    // Look up an existing key for this authenticated user.
-    const existing = await Payment.findOne({
-      where: { idempotencyKey, userId },
-    });
-
-    if (existing?.cachedResponse && Object.keys(existing.cachedResponse).length > 0) {
-      log.info({ idempotencyKey }, "Returning cached Razorpay response");
-
-      return res.status(200).json(existing.cachedResponse);
-    }
-
-    const amount = Math.round(Number(course.priceValue) * 100);
-
-    const options = {
-      amount,
-      currency: "INR",
-      receipt: `receipt_order_${course.id}_${Date.now()}`,
-    };
-
-    log.info({ courseTitle: course.title, userId }, "Initiating Razorpay payment");
-
-    // Persist the payment before contacting Razorpay.
-    const payment = await Payment.create({
-      userId,
-      courseId: course.id,
-      courseTitle: course.title || "Course",
-      amount,
-      currency: "INR",
-      status: "initiated",
-      gateway: "razorpay",
-      idempotencyKey,
-      cacheExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-    });
-
-    let order;
-
+router.post(
+  "/create-order",
+  protect,
+  validate({ body: createPaymentSchema }),
+  razorpayPaymentLimiter,
+  async (req, res) => {
     try {
-      order = await paymentGatewayServices.createRazorpayOrder(options);
-    } catch (razorpayErr) {
-      await payment.update({ status: "failed" });
+      const { course, courseId: bodyCourseId, idempotencyKey } = req.body;
+      const targetCourseId = bodyCourseId || course?.id;
 
-      log.error({ err: razorpayErr }, "Razorpay order creation failed");
+      const userId = req.user.id;
 
-      throw razorpayErr;
-    }
+      // Load course from database — NEVER trust client price or metadata
+      const courseRecord = await Course.findByPk(targetCourseId);
+      if (!courseRecord || courseRecord.status !== "published") {
+        return res.status(404).json({
+          success: false,
+          error: { code: "NOT_FOUND", message: "Course not found or unavailable", details: [] },
+        });
+      }
 
-    const cachedResponse = {
-      orderId: order.id,
-      amount: order.amount,
-      currency: order.currency,
-      paymentId: payment.id,
-    };
+      const priceValue = Number(courseRecord.priceValue);
+      if (!Number.isFinite(priceValue) || priceValue <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: { code: "BAD_REQUEST", message: "Invalid course price", details: [] },
+        });
+      }
 
-    await payment.update({
-      status: "processing",
-      razorpayOrderId: order.id,
-      cachedResponse,
-    });
+      log.info({ idempotencyKey }, "Idempotency key received");
 
-    log.info({ razorpayOrderId: order.id }, "Razorpay order created successfully");
-
-    return res.status(200).json(cachedResponse);
-  } catch (error) {
-    log.error({ err: error }, "Razorpay order creation error");
-
-    return res.status(500).json({
-      error: "Razorpay order creation failed",
-    });
-  }
-});
-
-// VERIFY PAYMENT AND ENROLL USER
-
-router.post("/verify", protect, async (req, res) => {
-  const orderIdForLog = req.body?.razorpay_order_id || "unknown";
-
-  try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, courseId, courseTitle } =
-      req.body;
-
-    // Always take the user ID from the authenticated token.
-    const userId = req.user.id;
-
-    if (
-      !razorpay_order_id ||
-      !razorpay_payment_id ||
-      !razorpay_signature ||
-      courseId == null ||
-      courseId === "" ||
-      !Number.isFinite(Number(courseId)) ||
-      !userId
-    ) {
-      return res.status(400).json({
-        success: false,
-        error: "Missing required parameters",
+      // Look up existing key and enforce user ownership.
+      const existing = await Payment.findOne({
+        where: { idempotencyKey },
       });
-    }
 
-    if (!process.env.RAZORPAY_KEY_SECRET) {
-      log.error("RAZORPAY_KEY_SECRET is not configured");
+      if (existing) {
+        if (existing.userId !== userId) {
+          return res.status(403).json({
+            success: false,
+            error: { code: "FORBIDDEN", message: "Unauthorized idempotency key", details: [] },
+          });
+        }
+        const hasCachedPayload =
+          existing.cachedResponse && Object.keys(existing.cachedResponse).length > 0;
+        const isNotExpired =
+          !existing.cacheExpiresAt || new Date(existing.cacheExpiresAt) > new Date();
+
+        if (hasCachedPayload && isNotExpired && existing.status !== "failed") {
+          log.info({ idempotencyKey }, "Returning cached Razorpay response");
+          return res.status(200).json(existing.cachedResponse);
+        }
+      }
+
+      const amount = Math.round(priceValue * 100);
+      const currency = (courseRecord.currency || "INR").toUpperCase();
+      const courseTitle = courseRecord.title || "Course";
+      const cacheExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+      const options = {
+        amount,
+        currency,
+        receipt: `receipt_order_${courseRecord.id}_${Date.now()}`,
+        notes: {
+          courseId: courseRecord.id.toString(),
+          courseTitle,
+        },
+      };
+
+      log.info({ courseTitle, userId }, "Initiating Razorpay payment");
+
+      // Persist or re-initiate the payment before contacting Razorpay.
+      let payment;
+      if (existing && typeof existing.update === "function") {
+        payment = existing;
+        await payment.update({
+          courseId: courseRecord.id,
+          courseTitle,
+          amount,
+          currency,
+          status: "initiated",
+          gateway: "razorpay",
+          cachedResponse: {},
+          cacheExpiresAt,
+        });
+      } else {
+        payment = await Payment.create({
+          userId,
+          courseId: courseRecord.id,
+          courseTitle,
+          amount,
+          currency,
+          status: "initiated",
+          gateway: "razorpay",
+          idempotencyKey,
+          cacheExpiresAt,
+        });
+      }
+
+      let order;
+
+      try {
+        order = await paymentGatewayServices.createRazorpayOrder(options);
+      } catch (razorpayErr) {
+        await payment.update({ status: "failed" });
+
+        log.error({ err: razorpayErr }, "Razorpay order creation failed");
+
+        throw razorpayErr;
+      }
+
+      const cachedResponse = {
+        orderId: order.id,
+        amount: order.amount,
+        currency: order.currency,
+        paymentId: payment.id,
+      };
+
+      await payment.update({
+        status: "processing",
+        razorpayOrderId: order.id,
+        cachedResponse,
+      });
+
+      log.info({ razorpayOrderId: order.id }, "Razorpay order created successfully");
+
+      return res.status(200).json(cachedResponse);
+    } catch (error) {
+      log.error({ err: error }, "Razorpay order creation error");
 
       return res.status(500).json({
         success: false,
-        error: "Payment verification failed",
+        error: { code: "INTERNAL_SERVER_ERROR", message: "Internal Server Error", details: [] },
       });
     }
+  },
+);
 
-    // Verify the Razorpay signature.
-    const sign = `${razorpay_order_id}|${razorpay_payment_id}`;
+// VERIFY PAYMENT AND ENROLL USER
 
-    const expectedSign = crypto
-      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(sign)
-      .digest("hex");
-
-    // Compare signatures safely.
-    const received = Buffer.from(razorpay_signature, "utf8");
-    const expected = Buffer.from(expectedSign, "utf8");
-
-    if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) {
-      return res.status(400).json({
-        success: false,
-        error: "Invalid signature",
-      });
-    }
-
-    let user;
-    let enrolledCourseId;
-    let enrolledCourseTitle;
-    let alreadyVerified = false;
-
-    const transaction = await sequelize.transaction();
+router.post(
+  "/verify",
+  protect,
+  validate({ body: verifyRazorpayPaymentSchema }),
+  async (req, res) => {
+    const orderIdForLog = req.body?.razorpay_order_id || "unknown";
 
     try {
-      // Lock the payment row to serialize concurrent verification.
-      const payment = await Payment.findOne({
-        where: {
-          razorpayOrderId: razorpay_order_id,
-          userId,
-        },
-        transaction,
-        lock: Transaction.LOCK.UPDATE,
-      });
+      // req.body is already validated: the three Razorpay fields are non-empty strings
+      // and courseId is a positive integer.
+      const { razorpay_order_id, razorpay_payment_id, razorpay_signature, courseId } = req.body;
 
-      if (!payment) {
-        await transaction.rollback();
+      // Always take the user ID from the authenticated token.
+      const userId = req.user.id;
 
-        return res.status(404).json({
+      if (!process.env.RAZORPAY_KEY_SECRET) {
+        log.error("RAZORPAY_KEY_SECRET is not configured");
+
+        return res.status(500).json({
           success: false,
-          error: "Payment not found",
+          error: {
+            code: "INTERNAL_SERVER_ERROR",
+            message: "Payment verification failed",
+            details: [],
+          },
         });
       }
 
-      // Ensure the client has not substituted another course.
-      if (payment.courseId != null && Number(courseId) !== Number(payment.courseId)) {
-        await transaction.rollback();
+      // Verify the Razorpay signature.
+      const sign = `${razorpay_order_id}|${razorpay_payment_id}`;
 
+      const expectedSign = crypto
+        .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+        .update(sign)
+        .digest("hex");
+
+      // Compare signatures safely.
+      const received = Buffer.from(razorpay_signature, "utf8");
+      const expected = Buffer.from(expectedSign, "utf8");
+
+      if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) {
         return res.status(400).json({
           success: false,
-          error: "Course does not match the paid order",
+          error: { code: "BAD_REQUEST", message: "Invalid signature", details: [] },
         });
       }
 
-      // Idempotent response for an already-verified payment.
-      if (payment.status === "success") {
-        await transaction.rollback();
+      let user;
+      let enrolledCourseId;
+      let enrolledCourseTitle;
+      let alreadyVerified = false;
 
-        return res.status(200).json({
-          success: true,
-          message: "Payment already verified",
+      const transaction = await sequelize.transaction();
+
+      try {
+        // Lock the payment row to serialize concurrent verification.
+        const payment = await Payment.findOne({
+          where: {
+            razorpayOrderId: razorpay_order_id,
+            userId,
+          },
+          transaction,
+          lock: Transaction.LOCK.UPDATE,
         });
+
+        if (!payment) {
+          await transaction.rollback();
+
+          return res.status(404).json({
+            success: false,
+            error: { code: "NOT_FOUND", message: "Payment not found", details: [] },
+          });
+        }
+
+        // Ensure the client has not substituted another course.
+        if (payment.courseId != null && Number(courseId) !== Number(payment.courseId)) {
+          await transaction.rollback();
+
+          return res.status(400).json({
+            success: false,
+            error: {
+              code: "BAD_REQUEST",
+              message: "Course does not match the paid order",
+              details: [],
+            },
+          });
+        }
+
+        // Idempotent response for an already-verified payment.
+        if (payment.status === "success") {
+          await transaction.rollback();
+
+          return res.status(200).json({
+            success: true,
+            message: "Payment already verified",
+          });
+        }
+
+        // Gateway verification: verify captured/paid status, amount, and currency with Razorpay
+        if (paymentGatewayServices.fetchRazorpayPayment && process.env.NODE_ENV !== "test") {
+          try {
+            const rzpPayment =
+              await paymentGatewayServices.fetchRazorpayPayment(razorpay_payment_id);
+            if (
+              !rzpPayment ||
+              (rzpPayment.status !== "captured" && rzpPayment.status !== "authorized") ||
+              (payment.amount != null && Number(rzpPayment.amount) !== Number(payment.amount)) ||
+              (payment.currency &&
+                rzpPayment.currency?.toUpperCase() !== payment.currency?.toUpperCase()) ||
+              (rzpPayment.order_id && rzpPayment.order_id !== razorpay_order_id)
+            ) {
+              await transaction.rollback();
+              return res.status(400).json({
+                success: false,
+                error: {
+                  code: "BAD_REQUEST",
+                  message: "Gateway payment details mismatch",
+                  details: [],
+                },
+              });
+            }
+          } catch (fetchErr) {
+            log.error({ err: fetchErr }, "Failed to verify payment with Razorpay gateway API");
+            await transaction.rollback();
+            return res.status(500).json({
+              success: false,
+              error: {
+                code: "INTERNAL_SERVER_ERROR",
+                message: "Payment verification failed with gateway",
+                details: [],
+              },
+            });
+          }
+        }
+
+        // Use the database record as the source of truth.
+        enrolledCourseId = Number(payment.courseId ?? courseId);
+        enrolledCourseTitle = payment.courseTitle?.trim() || "Course";
+
+        // Confirm the user exists before updating payment status.
+        user = await User.findByPk(userId, { transaction });
+
+        if (!user) {
+          await transaction.rollback();
+
+          return res.status(404).json({
+            success: false,
+            error: { code: "NOT_FOUND", message: "User not found", details: [] },
+          });
+        }
+
+        // Update the payment within the same transaction.
+        await payment.update(
+          {
+            status: "success",
+            razorpayPaymentId: razorpay_payment_id,
+          },
+          { transaction },
+        );
+
+        log.info({ razorpay_order_id, razorpay_payment_id }, "Razorpay payment verified");
+
+        const purchased = Array.isArray(user.purchasedCourses) ? [...user.purchasedCourses] : [];
+
+        const alreadyPurchased = purchased.some(
+          (item) => Number(item.courseId) === enrolledCourseId,
+        );
+
+        if (!alreadyPurchased) {
+          purchased.push({
+            courseId: enrolledCourseId,
+            courseTitle: enrolledCourseTitle,
+            purchaseDate: new Date(),
+            progress: {
+              completedLessons: [],
+              currentLesson: null,
+            },
+          });
+
+          user.purchasedCourses = purchased;
+          user.changed("purchasedCourses", true);
+
+          await user.save({ transaction });
+        }
+
+        await transaction.commit();
+
+        alreadyVerified = false;
+      } catch (err) {
+        if (!transaction.finished) {
+          await transaction.rollback();
+        }
+
+        throw err;
       }
 
-      // Use the database record as the source of truth.
-      enrolledCourseId = Number(payment.courseId ?? courseId);
-      enrolledCourseTitle = payment.courseTitle ?? courseTitle ?? "Course";
-
-      // Confirm the user exists before updating payment status.
-      user = await User.findByPk(userId, { transaction });
-
-      if (!user) {
-        await transaction.rollback();
-
-        return res.status(404).json({
-          success: false,
-          error: "User not found",
-        });
+      // Send notification after the transaction commits.
+      // A notification failure must not undo successful enrollment.
+      if (!alreadyVerified) {
+        try {
+          await createNotification(user.id, {
+            title: "Course Enrolled",
+            message: `You successfully enrolled in ${enrolledCourseTitle || "a course"}`,
+            type: "course",
+            metadata: {
+              courseId: enrolledCourseId,
+            },
+          });
+        } catch (err) {
+          log.error({ err }, "Failed to create enrollment notification");
+        }
       }
 
-      // Update the payment within the same transaction.
-      await payment.update(
+      return res.status(200).json({
+        success: true,
+        message: "Payment verified successfully",
+      });
+    } catch (error) {
+      log.error(
         {
-          status: "success",
-          razorpayPaymentId: razorpay_payment_id,
+          razorpayOrderId: orderIdForLog,
+          err: error,
         },
-        { transaction },
+        "Razorpay verification error",
       );
 
-      log.info({ razorpay_order_id, razorpay_payment_id }, "Razorpay payment verified");
-
-      const purchased = Array.isArray(user.purchasedCourses) ? [...user.purchasedCourses] : [];
-
-      const alreadyPurchased = purchased.some((item) => Number(item.courseId) === enrolledCourseId);
-
-      if (!alreadyPurchased) {
-        purchased.push({
-          courseId: enrolledCourseId,
-          courseTitle: enrolledCourseTitle,
-          purchaseDate: new Date(),
-          progress: {
-            completedLessons: [],
-            currentLesson: null,
-          },
-        });
-
-        user.purchasedCourses = purchased;
-        user.changed("purchasedCourses", true);
-
-        await user.save({ transaction });
-      }
-
-      await transaction.commit();
-
-      alreadyVerified = false;
-    } catch (err) {
-      if (!transaction.finished) {
-        await transaction.rollback();
-      }
-
-      throw err;
+      return res.status(500).json({
+        success: false,
+        error: { code: "INTERNAL_SERVER_ERROR", message: "Internal Server Error", details: [] },
+      });
     }
-
-    // Send notification after the transaction commits.
-    // A notification failure must not undo successful enrollment.
-    if (!alreadyVerified) {
-      try {
-        await createNotification(user.id, {
-          title: "Course Enrolled",
-          message: `You successfully enrolled in ${enrolledCourseTitle || "a course"}`,
-          type: "course",
-          metadata: {
-            courseId: enrolledCourseId,
-          },
-        });
-      } catch (err) {
-        log.error({ err }, "Failed to create enrollment notification");
-      }
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: "Payment verified successfully",
-    });
-  } catch (error) {
-    log.error(
-      {
-        razorpayOrderId: orderIdForLog,
-        err: error,
-      },
-      "Razorpay verification error",
-    );
-
-    return res.status(500).json({
-      success: false,
-      error: "Payment verification failed",
-    });
-  }
-});
+  },
+);
 
 export default router;
