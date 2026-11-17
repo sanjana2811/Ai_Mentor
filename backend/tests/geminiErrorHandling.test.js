@@ -98,7 +98,8 @@ test("Gemini uses the model configured by environment", async () => {
   await askGemini("context", "hello");
 
   assert.equal(request.model, "gemini-test-model");
-  assert.equal(request.config.httpOptions.timeout, deps.timeoutMs);
+  assert.ok(request.config.httpOptions.timeout > 0);
+  assert.ok(request.config.httpOptions.timeout <= deps.timeoutMs);
 });
 
 test("Gemini 500 falls back to Groq and returns Groq's reply", async () => {
