@@ -154,7 +154,7 @@ const buildGroqMessages = (systemInstruction, message, turns) => {
   else messages.push({ role: "user", content: message });
   return messages;
 };
-const askGroq = async (systemInstruction, message, turns, requestId) => {
+const askGroq = async (systemInstruction, message, turns, requestId, timeoutMs) => {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey || apiKey === "your_groq_api_key") {
     const error = new Error("Groq API key is not configured");
@@ -164,7 +164,7 @@ const askGroq = async (systemInstruction, message, turns, requestId) => {
   const model = process.env.GROQ_CHAT_MODEL?.trim() || "llama-3.3-70b-versatile";
   const startedAt = Date.now();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), deps.timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await deps.fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
@@ -240,6 +240,7 @@ Rules:
 `;
   const { turns = [] } = normalizeHistory(history);
   const geminiModel = process.env.GEMINI_CHAT_MODEL?.trim() || "gemini-2.5-flash";
+  const deadline = Date.now() + deps.timeoutMs;
   const startedAt = Date.now();
   try {
     if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "your_gemini_api_key") {
@@ -249,7 +250,7 @@ Rules:
     }
     const response = await getAIClient().models.generateContent({
       model: geminiModel,
-      config: { systemInstruction, httpOptions: { timeout: deps.timeoutMs } },
+      config: { systemInstruction, httpOptions: { timeout: Math.max(1, deadline - Date.now()) } },
       contents: turns.length ? buildContents(message, turns) : message,
     });
     const { text, moderated } = getGeminiText(response);
@@ -262,7 +263,13 @@ Rules:
     logProviderFailure("gemini", geminiModel, startedAt, geminiError, category, requestId);
   }
   try {
-    return await askGroq(systemInstruction, message, turns, requestId);
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      const timeoutError = new Error("Chat provider deadline exceeded");
+      timeoutError.name = "TimeoutError";
+      throw timeoutError;
+    }
+    return await askGroq(systemInstruction, message, turns, requestId, remainingMs);
   } catch (groqError) {
     return failure(groqError?.category || classifyGroqError(groqError).category);
   }
