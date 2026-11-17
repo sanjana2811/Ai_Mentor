@@ -464,5 +464,10 @@
     "continue_learning": "Continue Learning",
     "download": "Download Certificate",
     "generating": "Generating..."
+  },
+  "assistant": {
+    "unavailable": "The AI service is temporarily unavailable. Please try again.",
+    "requestFailed": "Sorry, something went wrong.",
+    "retry": "Try again"
   }
 }
