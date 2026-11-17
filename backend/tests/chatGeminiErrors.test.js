@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 process.env.NODE_ENV = "test";
 process.env.GEMINI_API_KEY = "fake-test-key";
+delete process.env.GROQ_API_KEY;
 
 const { default: User } = await import("../models/User.js");
 const { default: Preference } = await import("../models/Preference.js");
@@ -66,7 +67,7 @@ after(() => {
   Preference.findOne = originals.preferenceFindOne;
 });
 
-test("chat returns 200 with the reply and extracts the route on success", async () => {
+test("chat returns 200 with the reply and extracts the route on Gemini success", async () => {
   stubGemini(200, {
     candidates: [
       { content: { role: "model", parts: [{ text: "Open settings.\nROUTE:/settings" }] } },
@@ -87,33 +88,38 @@ const failures = [
   ["authentication failure", 401, "UNAUTHENTICATED", "auth", /currently unavailable/],
 ];
 
-for (const [label, status, id, category, wording] of failures) {
-  test(`chat returns a friendly 200 reply with error "${category}" on ${label}`, async () => {
+for (const [label, status, id, category] of failures) {
+  test(`chat returns structured HTTP 503 when both providers fail on ${label}`, async () => {
     stubGemini(status, { error: { code: status, status: id, message: SECRET } });
 
     const { statusCode, body } = await chat();
 
-    assert.equal(statusCode, 200);
-    assert.deepEqual(Object.keys(body).sort(), ["error", "reply", "route"]);
-    assert.equal(body.error, category);
-    assert.equal(body.route, null);
-    assert.match(body.reply, wording);
+    assert.equal(statusCode, 503);
+    assert.deepEqual(body, {
+      success: false,
+      code: "AI_PROVIDER_UNAVAILABLE",
+      message: "The AI service is temporarily unavailable. Please try again.",
+      requestId: "req-42",
+    });
     assert.ok(!JSON.stringify(body).includes(SECRET));
     assert.equal(logs.length, 1);
-    assert.deepEqual(logs[0][0], { category, status, providerStatus: id, requestId: "req-42" });
+    assert.equal(logs[0][0].category, category);
+    assert.equal(logs[0][0].status, status);
+    assert.equal(logs[0][0].requestId, "req-42");
+    assert.equal(logs[0][0].provider, "gemini");
     assert.ok(!JSON.stringify(logs).includes(SECRET));
   });
 }
 
-test('chat returns a friendly 200 reply with error "network" on network failure', async () => {
+test("chat returns structured HTTP 503 on Gemini network failure when Groq is not configured", async () => {
   globalThis.fetch = async () => {
     throw new TypeError("fetch failed");
   };
 
   const { statusCode, body } = await chat();
 
-  assert.equal(statusCode, 200);
-  assert.equal(body.error, "network");
-  assert.match(body.reply, /currently unavailable/);
+  assert.equal(statusCode, 503);
+  assert.equal(body.code, "AI_PROVIDER_UNAVAILABLE");
+  assert.equal(body.requestId, "req-42");
   assert.equal(logs[0][0].category, "network");
 });
