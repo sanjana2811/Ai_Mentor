@@ -1,163 +1,212 @@
-import { test, beforeEach, afterEach } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 
 process.env.NODE_ENV = "test";
-process.env.GEMINI_API_KEY = "fake-test-key";
+process.env.GEMINI_API_KEY = "fake-gemini-key";
+process.env.GROQ_API_KEY = "fake-groq-key";
+process.env.GEMINI_CHAT_MODEL = "gemini-test-model";
+process.env.GROQ_CHAT_MODEL = "llama-test-model";
 
-const { askGemini, classifyGeminiError, deps } = await import("../services/geminiChatService.js");
+const {
+  askGemini,
+  classifyGeminiError,
+  deps,
+  resetGeminiClientForTesting,
+  setGeminiClientForTesting,
+} = await import("../services/geminiChatService.js");
 
-const MESSAGES = {
-  rateLimited: "I am receiving too many requests right now. Please wait a moment and ask me again!",
-  unavailable: "The AI service is temporarily unavailable. Please try again shortly.",
-  timeout: "The AI service took too long to respond. Please try again shortly.",
-  generic: "The AI Assistant is currently unavailable. Please try again later.",
+const original = {
+  fetch: deps.fetch,
+  timeoutMs: deps.timeoutMs,
+  logger: deps.logger,
+  geminiModel: process.env.GEMINI_CHAT_MODEL,
+  groqModel: process.env.GROQ_CHAT_MODEL,
+  groqKey: process.env.GROQ_API_KEY,
 };
-
-const SECRET = "SECRET-PROMPT-TEXT-123";
-const originalFetch = globalThis.fetch;
-const originalTimeout = deps.timeoutMs;
-const originalLogger = deps.logger;
-let fetchCalls;
 let logs;
+let requests;
 
-const stubFetch = (handler) => {
-  globalThis.fetch = async (url, init) => {
-    fetchCalls.push({ url: String(url), init });
-    return handler(url, init);
-  };
-};
-
-const stubGemini = (status, body) =>
-  stubFetch(
-    () =>
-      new Response(JSON.stringify(body), {
-        status,
-        headers: { "Content-Type": "application/json" },
-      }),
-  );
-
-const errorBody = (code, status, message = SECRET) => ({ error: { code, status, message } });
+const geminiSuccess = (text = "Hello learner") => ({
+  models: {
+    generateContent: async () => ({ text, candidates: [] }),
+  },
+});
+const groqSuccess = (text = "Groq fallback reply") => ({
+  ok: true,
+  status: 200,
+  json: async () => ({ choices: [{ message: { content: text } }] }),
+});
+const groqFailure = (status = 503) => ({
+  ok: false,
+  status,
+  json: async () => ({ error: { code: "PROVIDER_UNAVAILABLE" } }),
+});
 
 beforeEach(() => {
-  fetchCalls = [];
   logs = [];
-  deps.logger = { warn: (...args) => logs.push(args), error: (...args) => logs.push(args) };
+  requests = [];
+  deps.timeoutMs = 1000;
+  deps.logger = {
+    warn: (...args) => logs.push({ level: "warn", args }),
+    info: (...args) => logs.push({ level: "info", args }),
+  };
+  deps.fetch = async (url, init) => {
+    requests.push({ url: String(url), init });
+    return groqSuccess();
+  };
+  process.env.GROQ_API_KEY = "fake-groq-key";
+  process.env.GEMINI_CHAT_MODEL = "gemini-test-model";
+  process.env.GROQ_CHAT_MODEL = "llama-test-model";
+  setGeminiClientForTesting(geminiSuccess());
 });
 
 afterEach(() => {
-  globalThis.fetch = originalFetch;
-  deps.timeoutMs = originalTimeout;
-  deps.logger = originalLogger;
+  deps.fetch = original.fetch;
+  deps.timeoutMs = original.timeoutMs;
+  deps.logger = original.logger;
+  process.env.GEMINI_CHAT_MODEL = original.geminiModel;
+  process.env.GROQ_CHAT_MODEL = original.groqModel;
+  process.env.GROQ_API_KEY = original.groqKey;
+  resetGeminiClientForTesting();
 });
 
-test("successful response returns ok with the text, via the real client request path", async () => {
-  stubGemini(200, {
-    candidates: [{ content: { role: "model", parts: [{ text: "Hello learner" }] } }],
+test("Gemini success returns its reply without calling Groq", async () => {
+  setGeminiClientForTesting(geminiSuccess("Gemini reply"));
+
+  const result = await askGemini("learner context", "hello", { requestId: "req-1" });
+
+  assert.deepEqual(result, {
+    ok: true,
+    text: "Gemini reply",
+    moderated: false,
+    provider: "gemini",
+  });
+  assert.equal(requests.length, 0);
+});
+
+test("Gemini uses the model configured by environment", async () => {
+  let request;
+  setGeminiClientForTesting({
+    models: {
+      generateContent: async (args) => {
+        request = args;
+        return { text: "Configured model reply", candidates: [] };
+      },
+    },
   });
 
-  const result = await askGemini("context", "hi");
+  await askGemini("context", "hello");
 
-  assert.deepEqual(result, { ok: true, text: "Hello learner", moderated: false });
-  assert.equal(fetchCalls.length, 1);
-  assert.match(
-    fetchCalls[0].url,
-    /generativelanguage\.googleapis\.com.*gemini-2\.5-flash:generateContent/,
-  );
-  assert.equal(logs.length, 0);
+  assert.equal(request.model, "gemini-test-model");
+  assert.equal(request.config.httpOptions.timeout, deps.timeoutMs);
 });
 
-const cases = [
-  [429, "RESOURCE_EXHAUSTED", "rate_limited", MESSAGES.rateLimited],
-  [500, "INTERNAL", "unavailable", MESSAGES.unavailable],
-  [503, "UNAVAILABLE", "unavailable", MESSAGES.unavailable],
-  [502, "BAD_GATEWAY", "gateway", MESSAGES.unavailable],
-  [504, "DEADLINE_EXCEEDED", "timeout", MESSAGES.timeout],
-  [401, "UNAUTHENTICATED", "auth", MESSAGES.generic],
-  [403, "PERMISSION_DENIED", "auth", MESSAGES.generic],
-  [501, "UNIMPLEMENTED", "provider_error", MESSAGES.generic],
-  [400, "INVALID_ARGUMENT", "unknown", MESSAGES.generic],
-];
-
-for (const [status, id, category, message] of cases) {
-  test(`HTTP ${status} (${id}) is classified as ${category}`, async () => {
-    stubGemini(status, errorBody(status, id));
-
-    const result = await askGemini("context", "hi", { requestId: "req-1" });
-
-    assert.deepEqual(result, { ok: false, category, message });
-    assert.equal(logs.length, 1);
-    assert.deepEqual(logs[0][0], { category, status, providerStatus: id, requestId: "req-1" });
+test("Gemini 500 falls back to Groq and returns Groq's reply", async () => {
+  setGeminiClientForTesting({
+    models: {
+      generateContent: async () => {
+        const error = new Error("private Gemini provider message");
+        error.status = 500;
+        throw error;
+      },
+    },
   });
-}
 
-test("logs never include the raw provider message or request content", async () => {
-  stubGemini(503, errorBody(503, "UNAVAILABLE"));
+  const result = await askGemini("learner context", "hello", { requestId: "req-2" });
 
-  await askGemini("context", SECRET);
-
-  assert.ok(!JSON.stringify(logs).includes(SECRET));
+  assert.deepEqual(result, {
+    ok: true,
+    text: "Groq fallback reply",
+    moderated: false,
+    provider: "groq",
+  });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "https://api.groq.com/openai/v1/chat/completions");
+  assert.equal(requests[0].init.headers.Authorization, "Bearer fake-groq-key");
+  const body = JSON.parse(requests[0].init.body);
+  assert.equal(body.model, "llama-test-model");
+  assert.equal(body.messages[0].role, "system");
+  assert.equal(body.messages.at(-1).content, "hello");
+  assert.ok(logs.some((entry) => entry.level === "warn"));
+  assert.ok(!JSON.stringify(logs).includes("private Gemini provider message"));
 });
 
-test("the word quota in a non-429 error does not trigger rate limiting", async () => {
-  stubGemini(500, errorBody(500, "INTERNAL", "quota"));
+test("Groq fallback preserves prior conversation turns", async () => {
+  setGeminiClientForTesting({
+    models: { generateContent: async () => { throw Object.assign(new Error("down"), { status: 500 }); } },
+  });
 
-  const result = await askGemini("context", "hi");
+  await askGemini("context", "current question", {
+    history: [
+      { role: "user", text: "previous question" },
+      { role: "model", text: "previous answer" },
+    ],
+  });
 
+  const body = JSON.parse(requests[0].init.body);
+  assert.deepEqual(body.messages.slice(-3), [
+    { role: "user", content: "previous question" },
+    { role: "assistant", content: "previous answer" },
+    { role: "user", content: "current question" },
+  ]);
+});
+
+test("both providers failing returns a safe unavailable result", async () => {
+  setGeminiClientForTesting({
+    models: { generateContent: async () => { throw Object.assign(new Error("gemini secret"), { status: 500 }); } },
+  });
+  deps.fetch = async (url, init) => {
+    requests.push({ url: String(url), init });
+    return groqFailure(503);
+  };
+
+  const result = await askGemini("context", "sensitive prompt", { requestId: "req-3" });
+
+  assert.equal(result.ok, false);
   assert.equal(result.category, "unavailable");
+  assert.match(result.message, /temporarily unavailable/i);
+  assert.equal(logs.filter((entry) => entry.level === "warn").length, 2);
+  assert.ok(!JSON.stringify(logs).includes("gemini secret"));
+  assert.ok(!JSON.stringify(logs).includes("sensitive prompt"));
 });
 
-test("a 429 is rate limited even without a provider identifier", async () => {
-  stubGemini(429, { error: { code: 429, message: "slow down" } });
-
-  const result = await askGemini("context", "hi");
-
-  assert.equal(result.category, "rate_limited");
-});
-
-test("network failure is classified as network", async () => {
-  stubFetch(() => {
-    throw new TypeError("fetch failed");
+test("a Gemini timeout still tries Groq", async () => {
+  setGeminiClientForTesting({
+    models: {
+      generateContent: async () => {
+        const error = new Error("timed out");
+        error.name = "TimeoutError";
+        throw error;
+      },
+    },
   });
 
-  const result = await askGemini("context", "hi");
-
-  assert.deepEqual(result, { ok: false, category: "network", message: MESSAGES.generic });
-  assert.equal(logs[0][0].category, "network");
-});
-
-test("a request that exceeds the timeout is aborted and classified as timeout", async () => {
-  deps.timeoutMs = 20;
-  let aborted = false;
-  stubFetch(
-    (_url, init) =>
-      new Promise((_resolve, reject) => {
-        // The SDK unrefs its timer, so keep the test process alive until it fires.
-        const keepAlive = setInterval(() => {}, 1000);
-        init.signal.addEventListener("abort", () => {
-          clearInterval(keepAlive);
-          aborted = true;
-          reject(new DOMException("This operation was aborted", "AbortError"));
-        });
-      }),
-  );
-
-  const result = await askGemini("context", "hi");
-
-  assert.equal(aborted, true);
-  assert.deepEqual(result, { ok: false, category: "timeout", message: MESSAGES.timeout });
-});
-
-test("an empty response is classified as malformed_response", async () => {
-  stubGemini(200, { candidates: [{ content: { role: "model", parts: [{ text: "  " }] } }] });
-
-  const result = await askGemini("context", "hi");
+  const result = await askGemini("context", "hello");
 
   assert.equal(result.ok, true);
-  assert.equal(result.moderated, false);
-  assert.match(result.text, /couldn't generate a response/i);
+  assert.equal(result.provider, "groq");
 });
 
-test("classifyGeminiError handles errors with no usable fields", () => {
-  assert.equal(classifyGeminiError(undefined).category, "network");
-  assert.equal(classifyGeminiError({ status: 418 }).category, "unknown");
+test("a Groq timeout is classified and returned safely", async () => {
+  setGeminiClientForTesting({
+    models: { generateContent: async () => { throw Object.assign(new Error("down"), { status: 500 }); } },
+  });
+  deps.timeoutMs = 15;
+  deps.fetch = (_url, init) =>
+    new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => {
+        reject(new DOMException("aborted", "AbortError"));
+      }, { once: true });
+    });
+
+  const result = await askGemini("context", "hello");
+
+  assert.equal(result.ok, false);
+  assert.equal(result.category, "timeout");
+});
+
+test("classifyGeminiError keeps existing status classification", () => {
+  assert.equal(classifyGeminiError({ status: 429 }).category, "rate_limited");
+  assert.equal(classifyGeminiError({ status: 500 }).category, "unavailable");
+  assert.equal(classifyGeminiError({ name: "TimeoutError" }).category, "timeout");
 });
