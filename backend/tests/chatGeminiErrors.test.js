@@ -16,6 +16,7 @@ const originals = {
   preferenceFindOne: Preference.findOne,
   fetch: globalThis.fetch,
   logger: deps.logger,
+  groqKey: process.env.GROQ_API_KEY,
 };
 let logs;
 
@@ -60,6 +61,8 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = originals.fetch;
   deps.logger = originals.logger;
+  if (originals.groqKey === undefined) delete process.env.GROQ_API_KEY;
+  else process.env.GROQ_API_KEY = originals.groqKey;
 });
 
 after(() => {
@@ -79,6 +82,34 @@ test("chat returns 200 with the reply and extracts the route on Gemini success",
   assert.equal(statusCode, 200);
   assert.deepEqual(body, { reply: "Open settings.", route: "/settings" });
   assert.equal(logs.length, 0);
+});
+
+test("chat falls back to Groq after a Gemini 500 and returns the Groq reply", async () => {
+  process.env.GROQ_API_KEY = "fake-groq-key";
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) {
+      return new Response(
+        JSON.stringify({ error: { code: 500, status: "INTERNAL", message: SECRET } }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (String(url).includes("api.groq.com/openai/v1/chat/completions")) {
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: "Groq answered successfully." } }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    throw new Error("Unexpected provider URL");
+  };
+
+  const { statusCode, body } = await chat();
+
+  assert.equal(statusCode, 200);
+  assert.equal(body.reply, "Groq answered successfully.");
+  assert.equal(body.route, null);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0][0].provider, "gemini");
+  assert.ok(!JSON.stringify(logs).includes(SECRET));
 });
 
 const failures = [
