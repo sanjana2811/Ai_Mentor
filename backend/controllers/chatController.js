@@ -224,7 +224,12 @@ export const chatWithAssistant = async (req, res, next) => {
 
     const result = await askGemini(context, message, { requestId: req.id, history });
     if (!result.ok) {
-      return res.json({ reply: result.message, route: null, error: result.category });
+      return res.status(503).json({
+        success: false,
+        code: "AI_PROVIDER_UNAVAILABLE",
+        message: "The AI service is temporarily unavailable. Please try again.",
+        requestId: req.id,
+      });
     }
     const routeMatch = result.text.match(/ROUTE:([^\r\n]*)/i);
     const requestedRoute = routeMatch ? routeMatch[1].trim() : null;
