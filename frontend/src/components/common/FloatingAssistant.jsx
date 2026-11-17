@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import axios from "axios";
+import { useTranslation } from "react-i18next";
 import { OPEN_ASSISTANT_EVENT } from "../dashboard/QuickActions";
 import { buildChatHistory } from "../../service/chatHistory.js";
 
@@ -38,6 +39,7 @@ const constrainAnchor = (anchor) => ({
 
 const FloatingAssistant = () => {
   const navigate = useNavigate();
+  const { t } = useTranslation();
   const [isOpen, setIsOpen] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -112,15 +114,16 @@ const FloatingAssistant = () => {
     setIsMinimized(false);
   };
 
-  const sendMessage = async () => {
-    const message = input.trim();
+  const sendMessage = async (retryContext = null) => {
+    const message = retryContext?.message || input.trim();
     if (!message || requestInFlight.current) return;
     requestInFlight.current = true;
-    const history = buildChatHistory(messages);
+    const history = retryContext?.history || buildChatHistory(messages);
     setLoading(true);
-    setMessages((previous) => [...previous, { sender: "user", text: message }]);
-    setInput("");
-
+    if (!retryContext) {
+      setMessages((previous) => [...previous, { sender: "user", text: message }]);
+      setInput("");
+    }
     try {
       const token = localStorage.getItem("token");
       const { data } = await axios.post(
@@ -138,12 +141,20 @@ const FloatingAssistant = () => {
         },
       ]);
     } catch (error) {
+      const unavailable =
+        error?.response?.status === 503 ||
+        error?.response?.data?.code === "AI_PROVIDER_UNAVAILABLE";
       setMessages((previous) => [
         ...previous,
         {
           sender: "assistant",
-          text: error?.response?.data?.message || "Sorry, something went wrong.",
+          text: unavailable
+            ? t("assistant.unavailable", "The AI service is temporarily unavailable. Please try again.")
+            : t("assistant.requestFailed", "Sorry, something went wrong."),
           isError: true,
+          retryable: unavailable,
+          retryMessage: message,
+          retryHistory: history,
         },
       ]);
     } finally {
@@ -385,6 +396,17 @@ const FloatingAssistant = () => {
                       }`}
                     >
                       <p className="whitespace-pre-wrap">{message.text}</p>
+                      {message.retryable && (
+                        <button
+                          type="button"
+                          onClick={() => sendMessage({ message: message.retryMessage, history: message.retryHistory })}
+                          disabled={loading}
+                          className="mt-3 inline-flex items-center gap-2 rounded-lg border border-[#3867D6]/30 px-3 py-2 text-xs font-semibold text-[#3867D6] transition hover:bg-[#3867D6]/10 disabled:opacity-50"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" />
+                          {t("assistant.retry", "Try again")}
+                        </button>
+                      )}
                       {message.route && (
                         <button
                           type="button"
