@@ -69,7 +69,8 @@ export const classifyGeminiError = (error) => {
   const providerStatus = providerStatusOf(error);
   let category = "unknown";
 
-  if (error?.name === "AbortError" || error?.name === "TimeoutError") category = "timeout";
+  if (error?.code === "MISSING_API_KEY") category = "config";
+  else if (error?.name === "AbortError" || error?.name === "TimeoutError") category = "timeout";
   else if (status === 429 || providerStatus === "RESOURCE_EXHAUSTED") category = "rate_limited";
   else if (
     status === 401 ||
@@ -159,6 +160,7 @@ const askGroq = async (systemInstruction, message, turns, requestId, timeoutMs) 
   if (!apiKey || apiKey === "your_groq_api_key") {
     const error = new Error("Groq API key is not configured");
     error.code = "MISSING_API_KEY";
+    error.category = "config";
     throw error;
   }
   const model = process.env.GROQ_CHAT_MODEL?.trim() || "llama-3.3-70b-versatile";
@@ -242,6 +244,7 @@ Rules:
   const geminiModel = process.env.GEMINI_CHAT_MODEL?.trim() || "gemini-2.5-flash";
   const deadline = Date.now() + deps.timeoutMs;
   const startedAt = Date.now();
+  let geminiFailureCategory = "unknown";
   try {
     if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "your_gemini_api_key") {
       const error = new Error("Gemini API key is not configured");
@@ -260,6 +263,7 @@ Rules:
     return { ok: true, text, moderated, provider: "gemini" };
   } catch (geminiError) {
     const { category } = classifyGeminiError(geminiError);
+    geminiFailureCategory = category;
     logProviderFailure("gemini", geminiModel, startedAt, geminiError, category, requestId);
   }
   try {
@@ -271,6 +275,7 @@ Rules:
     }
     return await askGroq(systemInstruction, message, turns, requestId, remainingMs);
   } catch (groqError) {
-    return failure(groqError?.category || classifyGroqError(groqError).category);
+    const groqCategory = groqError?.category || classifyGroqError(groqError).category;
+    return failure(groqCategory === "config" ? geminiFailureCategory : groqCategory);
   }
 };
