@@ -128,6 +128,24 @@ describe("FloatingAssistant regression tests", () => {
     expect(axios.post).toHaveBeenCalledTimes(2);
   });
 
+  it("shows a retry action after HTTP 503 and retries the same message", async () => {
+    axios.post
+      .mockRejectedValueOnce({
+        response: { status: 503, data: { code: "AI_PROVIDER_UNAVAILABLE" } },
+      })
+      .mockResolvedValueOnce({ data: { reply: "Recovered through fallback." } });
+    const { input, sendButton } = openAssistant();
+    fireEvent.change(input, { target: { value: "Explain databases" } });
+    fireEvent.click(sendButton);
+
+    const retryButton = await screen.findByRole("button", { name: /try again/i });
+    expect(screen.getByText(/AI service is temporarily unavailable/i)).toBeInTheDocument();
+    fireEvent.click(retryButton);
+    expect(await screen.findByText("Recovered through fallback.")).toBeInTheDocument();
+    expect(axios.post).toHaveBeenCalledTimes(2);
+    expect(screen.getAllByText("Explain databases")).toHaveLength(1);
+  });
+
   it("releases the request lock after failure", async () => {
     axios.post
       .mockRejectedValueOnce({ response: { data: { message: "Request failed" } } })
